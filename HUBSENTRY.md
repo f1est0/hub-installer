@@ -46,3 +46,154 @@ sudo sh hub-install.sh
 ## Важно
 
 HubSentry работает на небольшом домашнем сервере, поэтому возможны перерывы и изменения во время закрытого тестирования. Если сам сервер хаба потеряет интернет или питание, он не сможет отправить уведомление до восстановления связи.
+
+---
+
+# Подключение проекта к хабу
+
+Подключение занимает около пяти минут. Ничего устанавливать не нужно: клиент — один файл без зависимостей для Node.js/Next.js, Python и shell/cron.
+
+## Что получить у владельца хаба
+
+| Параметр | Пример |
+| --- | --- |
+| Адрес хаба `HUB_URL` | `https://uptime.profium.pro` |
+| Токен проекта `HUB_TOKEN` | `hub_AbC…` |
+
+Токен выдаётся на один проект. Храните его в переменных окружения или `.env`, не коммитьте в Git и не отправляйте в чаты. Если токен утёк, владелец может выпустить новый.
+
+## Какие сигналы отправлять
+
+1. **Heartbeat** — сигнал «я жив».
+2. **Задача по расписанию (`job`)** — например, бэкап, импорт или cron-задача с результатом `ok`/`fail`.
+3. **Ошибка (`event` уровня `error`)** — исключение из кода. Уровни `info` и `warn` сохраняются в истории.
+
+## Node.js / Next.js
+
+Добавьте клиент HubSentry в проект и задайте `HUB_URL` и `HUB_TOKEN`:
+
+```js
+import { createHub } from "./lib/hub-client.mjs";
+const hub = createHub();
+
+hub.startHeartbeat();
+hub.captureProcessErrors();
+
+await hub.job("backup", () => makeBackup(), { expectEveryS: 86400 });
+await hub.error(new Error("Не удалось списать оплату"), { orderId: 42 });
+```
+
+Для Next.js 15+ можно подключить `instrumentation.ts`: он включает heartbeat и отправляет ошибки серверных компонентов, route handlers и server actions.
+
+## Python
+
+Клиент работает на Python 3.8+ без зависимостей:
+
+```python
+from hub_client import Hub
+
+hub = Hub()
+hub.start_heartbeat()
+hub.capture_exceptions()
+
+with hub.job("backup", expect_every=86400):
+    make_backup()
+
+hub.error("Не удалось списать оплату", {"order": 42})
+```
+
+## Shell / cron
+
+Нужны только `sh` и `curl`:
+
+```cron
+15 3 * * * HUB_URL=https://uptime.profium.pro HUB_TOKEN=hub_xxx sh /opt/hub.sh run backup --every 86400 -- /opt/backup.sh
+* * * * * HUB_URL=https://uptime.profium.pro HUB_TOKEN=hub_xxx sh /opt/hub.sh heartbeat
+```
+
+`hub.sh run` возвращает код вашей команды и передаёт хабу последние строки вывода при ошибке.
+
+## Мониторинг сервера целиком
+
+Для контроля диска, памяти, процессора, Docker, служб, логов, баз данных и веб-сервера используется агент `hub-agent.sh`. Публичный загрузчик устанавливается так:
+
+```bash
+sudo sh hub-install.sh
+```
+
+Токен вводится при установке. Загрузчик проверяет цифровую подпись выпуска и контрольные суммы файлов до запуска.
+
+## Сертификаты и домены
+
+Если владелец указал URL проекта с `https`, хаб сам проверяет сертификат и предупреждает за 14, 7, 3 и 1 день до окончания. Срок регистрации домена проверяется, если задан домен проекта.
+
+## Чистый HTTP для любого языка
+
+```bash
+curl -fsS -X POST -H "Authorization: Bearer $HUB_TOKEN" "$HUB_URL/api/v1/heartbeat"
+curl -fsS -X POST -H "Authorization: Bearer $HUB_TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"backup","status":"ok","durationMs":1200,"expectEveryS":86400}' "$HUB_URL/api/v1/job"
+curl -fsS -X POST -H "Authorization: Bearer $HUB_TOKEN" -H "Content-Type: application/json" \
+  -d '{"level":"error","message":"Текст ошибки"}' "$HUB_URL/api/v1/event"
+curl -fsS -H "Authorization: Bearer $HUB_TOKEN" "$HUB_URL/api/v1/status"
+```
+
+Основные методы: `POST /api/v1/heartbeat`, `POST /api/v1/job`, `POST /api/v1/event`, `POST /api/v1/metrics`, `GET /api/v1/config` и `GET /api/v1/status`.
+
+Ответы: `200` — успех, `400` — неверные данные, `401` — неверный токен, `413` — тело больше 16 КБ, `429` — превышен лимит запросов.
+
+## Проверка подключения
+
+1. Запустите проект с заданными `HUB_URL` и `HUB_TOKEN`.
+2. Проверьте статус:
+
+   ```bash
+   curl -fsS -H "Authorization: Bearer $HUB_TOKEN" "$HUB_URL/api/v1/status"
+   ```
+
+3. Убедитесь, что проект отображается зелёным в боте.
+4. Отправьте тестовую ошибку и проверьте уведомление.
+
+## Гарантии клиента
+
+- Недоступность хаба не ломает ваш проект: запросы имеют таймаут пять секунд.
+- Если `HUB_URL` или `HUB_TOKEN` не заданы, клиент отключается.
+- Хаб получает только данные, которые вы явно отправили. Не передавайте в сообщениях и `meta` пароли, токены и персональные данные.
+
+## Контроль размера бэкапа
+
+При передаче `sizeBytes` хаб запоминает обычный размер результата и предупреждает, если новая копия пустая или меньше половины обычной. Это помогает заметить ситуацию, когда задача формально завершилась, но бэкап получился повреждённым или неполным.
+
+Примеры:
+
+```js
+await hub.job("backup", makeBackup, {
+  expectEveryS: 86400,
+  sizeBytes: (path) => fs.statSync(path).size,
+});
+```
+
+```sh
+sh hub.sh run backup --every 86400 --size-file '/backups/db-*.sql.gz' -- /opt/backup.sh
+```
+
+## Дополнительные проверки агента
+
+Владелец хаба может попросить агент:
+
+- проверить доступность внешних адресов, например `max.ru:443` или `api.telegram.org`;
+- следить за свежестью файлов бэкапа в указанной папке;
+- проверять читаемость свежего архива или дампа PostgreSQL;
+- проверять PostgreSQL, MySQL/MariaDB, MongoDB, ClickHouse, Elasticsearch/OpenSearch и Redis;
+- собирать статистику 5xx и времени ответа из логов nginx и Caddy.
+
+## Ограничения API
+
+Для одного проекта разрешено не больше 120 запросов в минуту. Размер тела запроса — до 16 КБ. Для `job` поддерживаются поля `name`, `status`, `message`, `durationMs`, `expectEveryS` и `sizeBytes`. Для `event` — `message`, `level` и необязательный объект `meta`.
+
+## Что согласовать перед подключением
+
+- как часто проект должен присылать heartbeat;
+- какие регулярные задачи нужно контролировать;
+- есть ли публичный адрес `/health` для внешней проверки;
+- где работает проект: Docker, systemd, cron или другой способ запуска.
